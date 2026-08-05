@@ -46,6 +46,12 @@ All marketing says *recorrido cinematográfico*. Never *tour 3D*, never *recorri
 
 ### Tiers
 
+> **Superseded for launch on 2026-08-04.** The authoritative launch catalog is defined in
+> `2026-08-04-recorrido-billing-approval-design.md`: USD 22 Single Listing, USD 32/month
+> or USD 320/year Pro with four monthly generations, and USD 79/month Agency with 12
+> shared monthly generations across up to three members. The table below is retained as
+> historical product-design context only.
+
 | | **Esencial** | **Profesional** (hero) | **Oficina** |
 |---|---|---|---|
 | Price USD | $19 | **$49** | $149 |
@@ -209,6 +215,12 @@ ffmpeg at `~/bin/ffmpeg`. Stitch clips with match cuts, lay Spanish voiceover (E
 ---
 
 ## 5. Payments
+
+> **Superseded for launch on 2026-08-04.** Recorrido uses Stripe hosted Checkout for
+> international cards, recurring subscriptions, and one-time generation credits. USD is
+> the canonical catalog currency and Stripe Adaptive Pricing handles eligible local
+> presentment. See `2026-08-04-recorrido-billing-approval-design.md` for the authoritative
+> billing, entitlement, and outbound-approval design.
 
 Colombia first: **Wompi** (Bancolombia-owned) covering PSE, Nequi, Bancolombia Transfer, and cards. Local entity, local currency, methods agents already use. Stripe does not serve Colombian local rails well.
 
