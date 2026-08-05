@@ -4,5 +4,6 @@ node_modules/
 accounts/
 media/
 out/
+.worktrees/
 *.mp4
 *.mov
