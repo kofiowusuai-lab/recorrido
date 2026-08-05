@@ -1,6 +1,10 @@
 node_modules/
 .env
 .env.local
+.env.*
+!.env.example
+supabase/.temp/
+supabase/functions/.env
 accounts/
 media/
 out/
