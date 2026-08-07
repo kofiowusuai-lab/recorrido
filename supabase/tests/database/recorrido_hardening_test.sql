@@ -230,6 +230,21 @@ select pg_temp.assert_true(
   'service_role does not effectively inherit any scoped worker RPC');
 
 select pg_temp.assert_true(
+  (select count(*) = 8
+     from pg_auth_members m
+     join pg_roles member_role on member_role.oid=m.member
+     join pg_roles worker_role on worker_role.oid=m.roleid
+    where member_role.rolname='authenticator'
+      and worker_role.rolname in (
+        'recorrido_billing_webhook_worker','recorrido_billing_checkout_worker',
+        'recorrido_billing_generation_worker','recorrido_billing_quota_worker',
+        'recorrido_billing_dispatcher_worker','recorrido_billing_approval_worker',
+        'recorrido_billing_reconciliation_worker','recorrido_billing_health_worker')
+      and m.set_option
+      and not m.inherit_option),
+  'PostgREST authenticator may SET ROLE into every scoped worker without inheriting privileges');
+
+select pg_temp.assert_true(
   exists (select 1 from pg_constraint where conname='recorrido_ledger_bucket_account_fkey')
   and exists (select 1 from pg_constraint where conname='recorrido_jobs_member_account_fkey')
   and exists (select 1 from pg_constraint where conname='recorrido_checkout_member_account_fkey'),
