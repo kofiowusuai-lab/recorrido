@@ -9,5 +9,6 @@ accounts/
 media/
 out/
 .worktrees/
+.task-monitor-id
 *.mp4
 *.mov
