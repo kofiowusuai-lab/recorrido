@@ -2587,3 +2587,12 @@ grant recorrido_billing_webhook_worker, recorrido_billing_checkout_worker,
   recorrido_billing_dispatcher_worker, recorrido_billing_approval_worker,
   recorrido_billing_reconciliation_worker, recorrido_billing_health_worker
   to service_role with inherit false, set true;
+
+-- PostgREST connects as authenticator and must be allowed to assume the exact
+-- role carried by each separately signed worker JWT. The membership is SET-only
+-- so authenticator never inherits worker privileges outside a verified request.
+grant recorrido_billing_webhook_worker, recorrido_billing_checkout_worker,
+  recorrido_billing_generation_worker, recorrido_billing_quota_worker,
+  recorrido_billing_dispatcher_worker, recorrido_billing_approval_worker,
+  recorrido_billing_reconciliation_worker, recorrido_billing_health_worker
+  to authenticator with inherit false, set true;

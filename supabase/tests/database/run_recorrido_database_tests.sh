@@ -91,6 +91,7 @@ $PSQL <<'SQL'
 create role anon nologin;
 create role authenticated nologin;
 create role service_role nologin;
+create role authenticator nologin;
 create table public.non_recorrido_privilege_sentinel(id integer);
 grant select on public.non_recorrido_privilege_sentinel to anon, authenticated;
 grant create on schema public to anon, authenticated, service_role;
