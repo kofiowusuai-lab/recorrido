@@ -1,0 +1,8 @@
+import type { Metadata } from 'next';
+import { notFound } from 'next/navigation';
+import { isLocale, localeContent, locales } from '@/lib/site/locales';
+import { MarketingPage } from '@/components/marketing/MarketingPage';
+
+export function generateStaticParams() { return locales.map((locale) => ({ locale })); }
+export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> { const { locale } = await params; if (!isLocale(locale)) return {}; const c = localeContent[locale]; return { title: c.metadata.title, description: c.metadata.description, alternates: { canonical: `/${locale}`, languages: { es: '/es', 'pt-BR': '/pt', en: '/en', 'x-default': '/es' } }, openGraph: { title: c.metadata.title, description: c.metadata.description, type: 'website', images: ['/media/hero-poster.webp'] } }; }
+export default async function LocalePage({ params }: { params: Promise<{ locale: string }> }) { const { locale } = await params; if (!isLocale(locale)) notFound(); const copy = localeContent[locale]; const jsonLd = { '@context': 'https://schema.org', '@type': 'Service', name: 'Recorrido', description: copy.metadata.description, areaServed: 'Latin America', provider: { '@type': 'Organization', name: 'SET PACE HOLDINGS LLC' }, offers: [{ '@type': 'Offer', priceCurrency: 'USD', price: '22' }, { '@type': 'Offer', priceCurrency: 'USD', price: '32' }, { '@type': 'Offer', priceCurrency: 'USD', price: '79' }] }; return <><script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(/</g, '\\u003c') }} /><MarketingPage locale={locale} copy={copy} /></>; }
