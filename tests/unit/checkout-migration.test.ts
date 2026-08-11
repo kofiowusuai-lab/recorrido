@@ -3,7 +3,9 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const migrationPath = resolve('supabase/migrations/202608120001_recorrido_public_checkout_onboarding.sql');
+const agencyAnnualMigrationPath = resolve('supabase/migrations/202608120002_recorrido_agency_annual.sql');
 const sql = () => readFileSync(migrationPath, 'utf8').toLowerCase();
+const agencyAnnualSql = () => readFileSync(agencyAnnualMigrationPath, 'utf8').toLowerCase();
 
 describe('public checkout onboarding migration contract', () => {
   it('adds only the private onboarding identity table and checkout adapter functions', () => {
@@ -60,6 +62,14 @@ describe('public checkout onboarding migration contract', () => {
     expect(source).toContain("'skip'");
     expect(source).toContain('recorrido_finalize_checkout_request');
     expect(source).toContain('security definer');
+  });
+
+  it('adds Agency annual through a forward migration without rewriting live history', () => {
+    const source = agencyAnnualSql();
+    expect(sql()).not.toContain("when 'agency_annual' then 'agency_annual_usd_790'");
+    expect(source).toContain("when 'agency_annual' then 'agency_annual_usd_790'");
+    expect(source).toContain("'agency_annual_usd_790', 'subscription', 'agency', null, 'year'");
+    expect(source).toContain('79000, 12, 3, true, true');
   });
 
   it('exposes every adapter function only to service_role', () => {

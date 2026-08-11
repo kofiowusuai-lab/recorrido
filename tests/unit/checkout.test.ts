@@ -26,11 +26,12 @@ describe('checkout boundary', () => {
     expect(isStripeCheckoutUrl('https://stripe.com/x')).toBe(false);
   });
 
-  it('maps the four public plans to canonical billing products and Stripe semantics', () => {
+  it('maps the five public plans to canonical billing products and Stripe semantics', () => {
     expect(canonicalProductCode('single')).toBe('single_listing_once_usd_22');
     expect(canonicalProductCode('pro_monthly')).toBe('pro_monthly_usd_32');
     expect(canonicalProductCode('pro_annual')).toBe('pro_annual_usd_320');
     expect(canonicalProductCode('agency_monthly')).toBe('agency_monthly_usd_79');
+    expect(canonicalProductCode('agency_annual')).toBe('agency_annual_usd_790');
     expect(checkoutSessionMode('single')).toBe('payment');
     expect(checkoutSessionMode('agency_monthly')).toBe('subscription');
     expect(purchaseType('single')).toBe('single_listing');
