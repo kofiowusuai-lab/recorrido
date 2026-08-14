@@ -8,7 +8,7 @@ const copy = {
   eyebrow: 'Message preferences', title: 'Stop Recorrido outreach', body: 'Confirm below.',
   confirm: 'Stop messages', missing: 'Use the complete link.', waiting: 'Processing…',
   success: 'You will no longer receive Recorrido outreach messages.', unavailable: 'Could not complete.',
-  fallback: 'Reply STOP in the original conversation.', back: 'Back to Recorrido',
+  fallback: 'Reply STOP in the original conversation.', back: 'Back to Recorrido', support: 'Email support',
 };
 const token = 'A'.repeat(32);
 
@@ -41,6 +41,7 @@ describe('OptOutPage', () => {
     render(<OptOutPage locale="es" copy={copy} />);
     expect(await screen.findByText(copy.missing)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: copy.confirm })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'recorrido@agentmail.to' })).toHaveAttribute('href', 'mailto:recorrido@agentmail.to');
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
