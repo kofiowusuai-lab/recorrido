@@ -7,7 +7,7 @@ import { parseOptOutFragment, validOptOutResponse } from '@/lib/site/optout';
 
 export type OptOutCopy = {
   eyebrow: string; title: string; body: string; confirm: string; missing: string; waiting: string;
-  success: string; unavailable: string; fallback: string; back: string;
+  success: string; unavailable: string; fallback: string; back: string; support: string;
 };
 
 const apiLocale = (locale: Locale) => locale === 'pt' ? 'pt-BR' : locale;
@@ -60,6 +60,7 @@ export function OptOutPage({ locale, copy }: { locale: Locale; copy: OptOutCopy 
         {ready && token && <button className="button" disabled={submitted} onClick={confirm}>{copy.confirm}</button>}
         {status && <p className="optout-status" role="status" aria-live="polite">{status}</p>}
         <p className="optout-fallback">{copy.fallback}</p>
+        <p className="optout-support">{copy.support}: <a href="mailto:recorrido@agentmail.to">recorrido@agentmail.to</a></p>
       </div>
       <Link className="optout-back" href={`/${locale}`}>← {copy.back}</Link>
     </section>
