@@ -13,9 +13,9 @@ describe('Recorrido public contract', () => {
 
   it('publishes every localized landing, legal, and purchase-result route', () => {
     expect(publicRoutes).toEqual([
-      '/es', '/es/privacidad', '/es/terminos', '/es/reembolsos', '/es/compra/exito', '/es/compra/cancelada',
-      '/pt', '/pt/privacidade', '/pt/termos', '/pt/reembolsos', '/pt/compra/sucesso', '/pt/compra/cancelada',
-      '/en', '/en/privacy', '/en/terms', '/en/refunds', '/en/purchase/success', '/en/purchase/canceled',
+      '/es', '/es/privacidad', '/es/terminos', '/es/reembolsos', '/es/compra/exito', '/es/compra/cancelada', '/es/baja',
+      '/pt', '/pt/privacidade', '/pt/termos', '/pt/reembolsos', '/pt/compra/sucesso', '/pt/compra/cancelada', '/pt/descadastro',
+      '/en', '/en/privacy', '/en/terms', '/en/refunds', '/en/purchase/success', '/en/purchase/canceled', '/en/opt-out',
     ]);
   });
 
