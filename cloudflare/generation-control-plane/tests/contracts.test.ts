@@ -163,6 +163,18 @@ describe("Supabase authority contract", () => {
     expect(rollback).toContain("do not drop");
   });
 
+  it("keeps agent-activity ranking private, regional, source-grounded, and non-authorizing", () => {
+    const ranking = read("../../supabase/migrations/202608150004_recorrido_agent_activity_priority.sql").toLowerCase();
+    expect(ranking).toContain("create materialized view public.recorrido_outreach_agent_activity_priority");
+    expect(ranking).toContain("raw_payload->>'active_listings'");
+    expect(ranking).toContain("raw_payload->>'harvested_at'");
+    expect(ranking).toContain("partition by workspace_id, country, department, city");
+    expect(ranking).toContain("'most_active_by_region'::text");
+    expect(ranking).toContain("revoke all on public.recorrido_outreach_agent_activity_priority from public, anon, authenticated");
+    expect(ranking).toContain("does not enroll, assign, authorize, or send outreach");
+    expect(ranking).not.toMatch(/insert\s+into\s+public\.recorrido_outreach_(campaigns|message_outbox|send_attempts)/);
+  });
+
   it("packages a secret-free Mac LaunchAgent with explicit enable and disable operations", () => {
     const plist = read("local/com.recorrido.cloudflare-generation-worker.plist");
     const installer = read("local/install.command");
