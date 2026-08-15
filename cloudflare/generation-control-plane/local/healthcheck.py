@@ -70,33 +70,34 @@ def queue_topology(name: str) -> dict[str, int]:
 
 
 def database_state() -> dict[str, Any]:
-    spec = importlib.util.spec_from_file_location("recorrido_promotion_helper", DB_HELPER)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("database_helper_unavailable")
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
-    conn = helper.connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("select cloudflare_generation_enabled, active_environment from public.recorrido_cloudflare_generation_runtime where singleton")
-            enabled, active_environment = cur.fetchone()
-            cur.execute("select count(*) from public.recorrido_generation_dispatch_outbox where status='dead'")
-            dead = cur.fetchone()[0]
-            cur.execute("""
-                select count(*) from public.recorrido_generation_dispatch_outbox
-                where status in ('pending','dispatching','enqueued')
-                  and updated_at < clock_timestamp() - interval '20 minutes'
-            """)
-            stale = cur.fetchone()[0]
-        return {"runtime_enabled": enabled, "active_environment": active_environment, "dead": dead, "stale": stale}
-    finally:
-        conn.close()
+    probe = f'''import importlib.util,json
+spec=importlib.util.spec_from_file_location("recorrido_promotion_helper", {str(DB_HELPER)!r})
+helper=importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
+conn=helper.connect()
+try:
+ with conn.cursor() as cur:
+  cur.execute("select cloudflare_generation_enabled, active_environment from public.recorrido_cloudflare_generation_runtime where singleton")
+  enabled, environment=cur.fetchone()
+  cur.execute("select count(*) from public.recorrido_generation_dispatch_outbox where status='dead'")
+  dead=cur.fetchone()[0]
+  cur.execute("select count(*) from public.recorrido_generation_dispatch_outbox where status in ('pending','dispatching','enqueued') and updated_at < clock_timestamp() - interval '20 minutes'")
+  stale=cur.fetchone()[0]
+ print(json.dumps({{"runtime_enabled":enabled,"active_environment":environment,"dead":dead,"stale":stale}}))
+finally: conn.close()
+'''
+    result = subprocess.run(
+        ["/usr/bin/python3", "-c", probe], check=True, capture_output=True, text=True, timeout=30,
+    )
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict):
+        raise RuntimeError("database_probe_invalid")
+    return value
 
 
 def local_state() -> dict[str, Any]:
     label = f"gui/{subprocess.check_output(['id','-u'], text=True).strip()}/com.recorrido.cloudflare-generation-worker"
     loaded = subprocess.run(["launchctl", "print", label], capture_output=True).returncode == 0
-    processes = subprocess.run(["pgrep", "-f", f"^{re.escape('/opt/homebrew/bin/python3.12')} {re.escape(LOCAL_SCRIPT)}"], capture_output=True, text=True)
+    processes = subprocess.run(["pgrep", "-f", re.escape(LOCAL_SCRIPT)], capture_output=True, text=True)
     count = len([line for line in processes.stdout.splitlines() if line.strip()]) if processes.returncode in (0, 1) else 0
     return {"loaded": loaded, "processes": count}
 
