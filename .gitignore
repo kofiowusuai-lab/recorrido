@@ -1,9 +1,9 @@
+.next/
 node_modules/
-.env
-.env.local
-accounts/
-media/
-out/
-.worktrees/
-*.mp4
-*.mov
+playwright-report/
+test-results/
+tsconfig.tsbuildinfo
+.env*
+!.env.example
+.DS_Store
+.vercel

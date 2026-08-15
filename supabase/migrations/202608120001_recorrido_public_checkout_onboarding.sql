@@ -1,0 +1,302 @@
+-- Narrow website adapter over the deployed Recorrido billing authority.
+-- Payment reconciliation remains exclusively owned by the existing Supabase authority.
+
+begin;
+
+create table public.recorrido_public_checkout_identities (
+  id uuid primary key default gen_random_uuid(),
+  reservation_id uuid not null unique default gen_random_uuid(),
+  normalized_email text not null unique
+    check (normalized_email = lower(btrim(normalized_email)) and length(normalized_email) between 3 and 160),
+  phone_e164 text not null unique check (phone_e164 ~ '^\+[1-9][0-9]{7,14}$'),
+  account_id uuid not null unique references public.recorrido_customer_accounts(id) on delete restrict,
+  member_id uuid not null unique references public.recorrido_account_members(id) on delete restrict,
+  full_name text not null check (length(full_name) between 2 and 160 and full_name = btrim(full_name)),
+  office text not null check (length(office) <= 160 and office = btrim(office)),
+  country char(2) not null check (country ~ '^[A-Z]{2}$'),
+  locale text not null check (locale in ('es', 'pt', 'en')),
+  created_at timestamptz not null default clock_timestamp(),
+  expires_at timestamptz not null default (clock_timestamp() + interval '35 minutes'),
+  claimed_at timestamptz,
+  updated_at timestamptz not null default clock_timestamp(),
+  constraint recorrido_public_checkout_reservation_ttl_check
+    check (expires_at > created_at and expires_at <= created_at + interval '35 minutes'),
+  constraint recorrido_public_checkout_claimed_after_create_check
+    check (claimed_at is null or claimed_at >= created_at),
+  constraint recorrido_public_checkout_identity_member_account_fkey
+    foreign key (account_id, member_id)
+    references public.recorrido_account_members(account_id, id) on delete restrict
+);
+
+comment on column public.recorrido_public_checkout_identities.reservation_id is
+  'Explicit marker linking the temporary public reservation to its reserved account_id/member_id pair.';
+comment on column public.recorrido_public_checkout_identities.claimed_at is
+  'Set once billing or other established-account evidence makes this identity non-reclaimable.';
+
+alter table public.recorrido_public_checkout_identities enable row level security;
+revoke all on table public.recorrido_public_checkout_identities from public, anon, authenticated;
+
+create or replace function public.recorrido_cleanup_abandoned_public_checkout(
+  p_normalized_email text,
+  p_phone_e164 text
+)
+returns integer
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_identity public.recorrido_public_checkout_identities;
+  v_removed integer := 0;
+  v_has_evidence boolean;
+begin
+  for v_identity in
+    select i.*
+      from public.recorrido_public_checkout_identities i
+     where i.claimed_at is null
+       and i.expires_at <= clock_timestamp()
+       and (i.normalized_email = lower(btrim(p_normalized_email)) or i.phone_e164 = p_phone_e164)
+     order by i.id
+     for update
+  loop
+    perform pg_advisory_xact_lock(hashtextextended('recorrido-public-email:' || v_identity.normalized_email, 0));
+    perform pg_advisory_xact_lock(hashtextextended('recorrido-public-phone:' || v_identity.phone_e164, 0));
+    select
+      exists (select 1 from public.recorrido_checkout_requests cr
+               where cr.account_id = v_identity.account_id
+                 and ((cr.status not in ('pending','failed','expired')
+                       and not (cr.status = 'created' and cr.expires_at <= clock_timestamp()))
+                      or cr.stripe_payment_intent_id is not null))
+      or exists (select 1 from public.recorrido_payment_records pr where pr.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_stripe_customers sc where sc.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_subscription_entitlements se where se.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_credit_buckets cb where cb.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_credit_ledger cl where cl.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_generation_jobs gj where gj.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_generation_reservations gr where gr.account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_referral_attributions ra
+                  where (ra.referred_account_id = v_identity.account_id and ra.status <> 'checkout_bound')
+                     or ra.referrer_account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_referral_rewards rr where rr.recipient_account_id = v_identity.account_id)
+      or exists (select 1 from public.recorrido_whatsapp_identities wi
+                  where wi.account_id = v_identity.account_id
+                    and (wi.verified_at is not null or wi.wa_id is not null or wi.last_inbound_at is not null))
+      or exists (select 1 from public.recorrido_account_members am
+                  where am.account_id = v_identity.account_id and am.id <> v_identity.member_id)
+      into v_has_evidence;
+
+    if v_has_evidence then
+      update public.recorrido_public_checkout_identities
+         set claimed_at = clock_timestamp(), updated_at = clock_timestamp()
+       where id = v_identity.id and claimed_at is null;
+      continue;
+    end if;
+
+    -- The authority makes these rows append-only. Exclusive locks plus transactional
+    -- trigger suspension make this narrowly guarded abandoned-reservation deletion atomic;
+    -- an error rolls both data and trigger state back.
+    lock table public.recorrido_referral_attributions,
+      public.recorrido_checkout_referral_choices,
+      public.recorrido_checkout_requests in access exclusive mode;
+    alter table public.recorrido_referral_attributions disable trigger recorrido_referral_attributions_protected;
+    alter table public.recorrido_checkout_referral_choices disable trigger recorrido_checkout_referral_choices_immutable;
+    alter table public.recorrido_checkout_requests disable trigger recorrido_checkout_requests_immutable;
+
+    delete from public.recorrido_referral_attributions ra
+     where ra.referred_account_id = v_identity.account_id
+       and ra.status = 'checkout_bound'
+       and exists (select 1 from public.recorrido_checkout_requests cr
+                    where cr.id = ra.checkout_request_id and cr.account_id = v_identity.account_id
+                      and (cr.status in ('pending','failed','expired')
+                           or (cr.status = 'created' and cr.expires_at <= clock_timestamp()))
+                      and cr.stripe_payment_intent_id is null);
+    delete from public.recorrido_checkout_referral_choices choice
+     where choice.account_id = v_identity.account_id
+       and exists (select 1 from public.recorrido_checkout_requests cr
+                    where cr.id = choice.checkout_request_id and cr.account_id = v_identity.account_id
+                      and (cr.status in ('pending','failed','expired')
+                           or (cr.status = 'created' and cr.expires_at <= clock_timestamp()))
+                      and cr.stripe_payment_intent_id is null);
+    delete from public.recorrido_checkout_requests cr
+     where cr.account_id = v_identity.account_id
+       and (cr.status in ('pending','failed','expired')
+            or (cr.status = 'created' and cr.expires_at <= clock_timestamp()))
+       and cr.stripe_payment_intent_id is null;
+
+    alter table public.recorrido_checkout_requests enable trigger recorrido_checkout_requests_immutable;
+    alter table public.recorrido_checkout_referral_choices enable trigger recorrido_checkout_referral_choices_immutable;
+    alter table public.recorrido_referral_attributions enable trigger recorrido_referral_attributions_protected;
+
+    delete from public.recorrido_whatsapp_identities
+     where account_id = v_identity.account_id and member_id = v_identity.member_id
+       and phone_e164 = v_identity.phone_e164 and verified_at is null
+       and wa_id is null and last_inbound_at is null;
+    if not found then raise exception 'temporary public phone changed during cleanup' using errcode = '40001'; end if;
+    delete from public.recorrido_public_checkout_identities where id = v_identity.id;
+    delete from public.recorrido_account_members
+     where id = v_identity.member_id and account_id = v_identity.account_id
+       and role = 'owner' and status in ('invited','active');
+    if not found then raise exception 'temporary public member changed during cleanup' using errcode = '40001'; end if;
+    delete from public.recorrido_customer_accounts
+     where id = v_identity.account_id and status = 'active';
+    if not found then raise exception 'temporary public account changed during cleanup' using errcode = '40001'; end if;
+    v_removed := v_removed + 1;
+  end loop;
+  return v_removed;
+end;
+$$;
+
+create or replace function public.recorrido_prepare_public_checkout(
+  p_plan_code text,
+  p_locale text,
+  p_name text,
+  p_email text,
+  p_phone_e164 text,
+  p_country text,
+  p_office text,
+  p_success_url text,
+  p_cancel_url text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_plan_code text := lower(btrim(coalesce(p_plan_code, '')));
+  v_product_code text;
+  v_locale text := lower(btrim(coalesce(p_locale, '')));
+  v_name text := regexp_replace(btrim(coalesce(p_name, '')), '[[:space:]]+', ' ', 'g');
+  v_email text := lower(btrim(coalesce(p_email, '')));
+  v_phone text := regexp_replace(btrim(coalesce(p_phone_e164, '')), '[^+0-9]', '', 'g');
+  v_country text := upper(btrim(coalesce(p_country, '')));
+  v_office text := regexp_replace(btrim(coalesce(p_office, '')), '[[:space:]]+', ' ', 'g');
+  v_identity public.recorrido_public_checkout_identities;
+  v_email_identity public.recorrido_public_checkout_identities;
+  v_phone_identity public.recorrido_public_checkout_identities;
+  v_account_id uuid;
+  v_member_id uuid;
+  v_digest text;
+  v_request jsonb;
+begin
+  v_product_code := case v_plan_code
+    when 'single' then 'single_listing_once_usd_22'
+    when 'pro_monthly' then 'pro_monthly_usd_32'
+    when 'pro_annual' then 'pro_annual_usd_320'
+    when 'agency_monthly' then 'agency_monthly_usd_79'
+    else null
+  end;
+  if v_product_code is null
+    or length(v_name) not between 2 and 160
+    or v_email !~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$'
+    or length(v_email) > 160
+    or v_phone !~ '^\+[1-9][0-9]{7,14}$'
+    or v_country !~ '^[A-Z]{2}$'
+    or length(v_office) > 160
+    or v_locale not in ('es', 'pt', 'en')
+    or p_success_url !~ '^https://[^[:space:]]+$'
+    or p_cancel_url !~ '^https://[^[:space:]]+$' then
+    raise exception 'invalid public checkout input' using errcode = '22023';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('recorrido-public-email:' || v_email, 0));
+  perform pg_advisory_xact_lock(hashtextextended('recorrido-public-phone:' || v_phone, 0));
+  perform public.recorrido_cleanup_abandoned_public_checkout(v_email, v_phone);
+
+  select * into v_email_identity from public.recorrido_public_checkout_identities
+   where normalized_email = v_email for update;
+  select * into v_phone_identity from public.recorrido_public_checkout_identities
+   where phone_e164 = v_phone for update;
+
+  if v_email_identity.id is not null or v_phone_identity.id is not null then
+    if v_email_identity.id is null or v_phone_identity.id is null
+       or v_email_identity.id is distinct from v_phone_identity.id then
+      raise exception 'public checkout identity conflict' using errcode = '22000';
+    end if;
+    v_identity := v_email_identity;
+    if v_identity.claimed_at is not null or not (v_identity.expires_at > clock_timestamp()) then
+      raise exception 'public checkout identity is established' using errcode = '42501';
+    end if;
+  else
+    if exists (select 1 from public.recorrido_customer_accounts a
+                where lower(btrim(a.billing_email)) = v_email)
+       or exists (select 1 from public.recorrido_account_members m
+                   where m.phone_e164 = v_phone and m.status in ('invited','active'))
+       or exists (select 1 from public.recorrido_whatsapp_identities w where w.phone_e164 = v_phone) then
+      raise exception 'public checkout identity is established' using errcode = '42501';
+    end if;
+    insert into public.recorrido_customer_accounts(display_name, billing_email, home_country)
+    values(coalesce(nullif(v_office, ''), v_name), v_email, v_country)
+    returning id into v_account_id;
+    insert into public.recorrido_account_members(account_id, full_name, phone_e164, role, status)
+    values(v_account_id, v_name, v_phone, 'owner', 'active') returning id into v_member_id;
+    insert into public.recorrido_whatsapp_identities(account_id, member_id, phone_e164)
+    values(v_account_id, v_member_id, v_phone);
+    insert into public.recorrido_public_checkout_identities(
+      normalized_email, phone_e164, account_id, member_id, full_name, office, country, locale,
+      expires_at)
+    values(v_email, v_phone, v_account_id, v_member_id, v_name, v_office, v_country, v_locale,
+      clock_timestamp() + interval '35 minutes')
+    returning * into v_identity;
+  end if;
+
+  v_digest := encode(digest(concat_ws(E'\n', v_identity.reservation_id::text, v_plan_code, v_locale,
+    v_email, v_phone, p_success_url, p_cancel_url), 'sha256'), 'hex');
+  v_request := public.recorrido_create_checkout_request_with_referral(
+    v_identity.account_id, v_identity.member_id, 'public:' || v_digest,
+    v_product_code, 'sha256:' || v_digest,
+    jsonb_build_object('success_url', p_success_url, 'cancel_url', p_cancel_url), 'SKIP');
+
+  return v_request || jsonb_build_object(
+    'account_id', v_identity.account_id,
+    'member_id', v_identity.member_id,
+    'product_code', v_product_code,
+    'reservation_id', v_identity.reservation_id,
+    'reservation_expires_at', v_identity.expires_at
+  );
+end;
+$$;
+
+create or replace function public.recorrido_finalize_public_checkout(
+  p_request_id uuid,
+  p_account_id uuid,
+  p_member_id uuid,
+  p_product_code text,
+  p_stripe_checkout_session_id text,
+  p_checkout_url text,
+  p_expires_at timestamptz
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare v_reservation_expires_at timestamptz;
+begin
+  select expires_at into v_reservation_expires_at
+    from public.recorrido_public_checkout_identities
+   where account_id = p_account_id and member_id = p_member_id
+     and claimed_at is null and expires_at > clock_timestamp()
+   for update;
+  if v_reservation_expires_at is null or p_expires_at > v_reservation_expires_at
+     or p_expires_at <= clock_timestamp() then
+    raise exception 'invalid public checkout expiration' using errcode = '22023';
+  end if;
+  return public.recorrido_finalize_checkout_request(
+    p_request_id, p_account_id, p_member_id, p_product_code,
+    p_stripe_checkout_session_id, p_checkout_url, p_expires_at
+  );
+end;
+$$;
+
+revoke all on function public.recorrido_cleanup_abandoned_public_checkout(text,text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.recorrido_prepare_public_checkout(text,text,text,text,text,text,text,text,text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.recorrido_finalize_public_checkout(uuid,uuid,uuid,text,text,text,timestamptz)
+  from public, anon, authenticated, service_role;
+grant execute on function public.recorrido_cleanup_abandoned_public_checkout(text,text) to service_role;
+grant execute on function public.recorrido_prepare_public_checkout(text,text,text,text,text,text,text,text,text) to service_role;
+grant execute on function public.recorrido_finalize_public_checkout(uuid,uuid,uuid,text,text,text,timestamptz) to service_role;
+
+commit;

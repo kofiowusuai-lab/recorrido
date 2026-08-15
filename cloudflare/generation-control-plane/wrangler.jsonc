@@ -1,0 +1,82 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "recorrido-generation-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-14",
+  "workers_dev": true,
+  "vars": {
+    "ENVIRONMENT": "production",
+    "RELEASE": "2026-08-15.1"
+  },
+  "r2_buckets": [
+    { "binding": "INPUTS", "bucket_name": "recorrido-generation-inputs" },
+    { "binding": "OUTPUTS", "bucket_name": "recorrido-generation-outputs" },
+    { "binding": "TEMP", "bucket_name": "recorrido-generation-temp" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "GENERATION_QUEUE", "queue": "recorrido-generation-queue" }
+    ],
+    "consumers": [
+      {
+        "queue": "recorrido-generation-queue",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "recorrido-generation-dlq"
+      },
+      {
+        "queue": "recorrido-generation-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 10
+      }
+    ]
+  },
+  "triggers": { "crons": ["*/1 * * * *"] },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1 }
+  },
+  "env": {
+    "staging": {
+      "name": "recorrido-generation-control-plane-staging",
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "RELEASE": "2026-08-15.1-staging"
+      },
+      "r2_buckets": [
+        { "binding": "INPUTS", "bucket_name": "recorrido-generation-inputs-staging" },
+        { "binding": "OUTPUTS", "bucket_name": "recorrido-generation-outputs-staging" },
+        { "binding": "TEMP", "bucket_name": "recorrido-generation-temp-staging" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "GENERATION_QUEUE", "queue": "recorrido-generation-queue-staging" }
+        ],
+        "consumers": [
+          {
+            "queue": "recorrido-generation-queue-staging",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 3,
+            "dead_letter_queue": "recorrido-generation-dlq-staging"
+          },
+          {
+            "queue": "recorrido-generation-dlq-staging",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 10
+          }
+        ]
+      },
+      "triggers": { "crons": ["*/1 * * * *"] },
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1 }
+      }
+    }
+  }
+}
