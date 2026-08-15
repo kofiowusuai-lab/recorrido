@@ -9,10 +9,16 @@ SCRIPT="$HOME/.hermes/scripts/recorrido_cloudflare_generation_worker.py"
 HEALTHCHECK="$HOME/.hermes/scripts/recorrido_cloudflare_generation_healthcheck.py"
 ENV_FILE="$HOME/.config/recorrido/cloudflare-generation.env"
 PYTHON="/opt/homebrew/bin/python3.12"
+FFMPEG="/opt/homebrew/bin/ffmpeg"
+FFPROBE="/opt/homebrew/bin/ffprobe"
 GENERATOR="/Users/AIAgenterminal/recorrido/scripts/generate_recorrido_v16_batch.py"
 
 if [ ! -x "$PYTHON" ]; then
   echo "trusted Python 3.12 missing: $PYTHON" >&2
+  exit 1
+fi
+if [ ! -x "$FFMPEG" ] || [ ! -x "$FFPROBE" ]; then
+  echo "trusted Homebrew FFmpeg tools missing: $FFMPEG / $FFPROBE" >&2
   exit 1
 fi
 if ! "$PYTHON" "$GENERATOR" --help >/dev/null 2>&1; then
@@ -25,6 +31,18 @@ install -m 700 "$HERE/worker.py" "$SCRIPT"
 install -m 700 "$HERE/healthcheck.py" "$HEALTHCHECK"
 install -m 600 "$HERE/$LABEL.plist" "$PLIST"
 
+wait_for_unload() {
+  local attempt
+  for ((attempt=0; attempt<40; attempt++)); do
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "worker did not unload before bootstrap: $DOMAIN/$LABEL" >&2
+  return 1
+}
+
 case "${1:-}" in
   --enable)
     if [ ! -f "$ENV_FILE" ] || [ "$(stat -f '%Lp' "$ENV_FILE")" != "600" ]; then
@@ -32,11 +50,13 @@ case "${1:-}" in
       exit 1
     fi
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    wait_for_unload
     launchctl bootstrap "$DOMAIN" "$PLIST"
     launchctl kickstart -k "$DOMAIN/$LABEL"
     ;;
   --disable)
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    wait_for_unload
     ;;
   "")
     echo "installed but disabled: $PLIST"
