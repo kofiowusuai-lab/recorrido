@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 import stat
 import subprocess
 import sys
@@ -15,6 +16,21 @@ from tempfile import TemporaryDirectory
 import pytest
 
 MODULE = Path(__file__).parents[1] / "local/worker.py"
+PLIST = Path(__file__).parents[1] / "local/com.recorrido.cloudflare-generation-worker.plist"
+INSTALLER = Path(__file__).parents[1] / "local/install.command"
+
+
+def test_launchagent_path_includes_homebrew_media_tools() -> None:
+    payload = plistlib.loads(PLIST.read_bytes())
+    path = payload["EnvironmentVariables"]["PATH"].split(":")
+    assert path[:2] == ["/opt/homebrew/bin", "/usr/local/bin"]
+    assert path[-4:] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+
+def test_installer_waits_for_launchagent_to_unload_before_bootstrap() -> None:
+    script = INSTALLER.read_text()
+    assert 'launchctl print "$DOMAIN/$LABEL"' in script
+    assert 'worker did not unload before bootstrap' in script
 
 
 def load_module():
