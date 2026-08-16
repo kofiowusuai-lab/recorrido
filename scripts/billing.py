@@ -110,6 +110,18 @@ class Account:
         return self.status in ACTIVE_STATES
 
 
+@dataclass(frozen=True)
+class Generation:
+    id: str
+    e164: str
+    listing_key: str
+    output_format: str
+    state: str
+    created_at: float
+    settled_at: float | None
+    detail: str
+
+
 class Billing:
     def __init__(self, db_path: Path | str, *, clock: Callable[[], float] = time.time,
                  stripe=None):
@@ -245,6 +257,24 @@ class Billing:
         return self.account(e164)
 
     # -- quota -------------------------------------------------------------
+
+    def generation(self, generation_id: str) -> Generation:
+        """Return the immutable delivery identity attached to a reservation."""
+        row = self._db.execute(
+            "select * from generations where id=?", (generation_id,)
+        ).fetchone()
+        if row is None:
+            raise BillingError(f"unknown generation {generation_id}")
+        return Generation(
+            id=row["id"],
+            e164=row["e164"],
+            listing_key=row["listing_key"] or "",
+            output_format=row["output_format"],
+            state=row["state"],
+            created_at=row["created_at"],
+            settled_at=row["settled_at"],
+            detail=row["detail"] or "",
+        )
 
     @staticmethod
     def _validated_formats(output_formats: tuple[str, ...]) -> tuple[str, ...]:
