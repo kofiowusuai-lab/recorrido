@@ -14,6 +14,18 @@ from PIL import Image, ImageDraw, ImageOps
 SAMPLE_FRACTIONS = (0.05, 0.25, 0.5, 0.75, 0.95)
 PARALLAX_SAMPLE_COUNT = 17
 THUMB = (160, 284)
+QUALITY_FLOOR = "recorrido-valley-brook-wide-v1"
+NATIVE_CANVASES = {"9:16": "720x1280", "16:9": "1280x720"}
+REQUIRED_FRAMING_CHECKS = (
+    "source_faithful_wide_anchor",
+    "whole_property_or_room_width_preserved",
+    "no_primary_architecture_cut",
+    "no_squash_or_stretch",
+    "no_center_crop_conversion",
+    "no_push_in_or_zoom_only",
+    "begins_on_exact_anchor",
+    "native_aspect_ratio",
+)
 
 
 def sha256(path: Path) -> str:
@@ -86,6 +98,97 @@ def is_supported_motion_canvas(width: int, height: int) -> bool:
     )
 
 
+def quality_contract_errors(manifest: dict) -> list[str]:
+    """Reject any route outside the approved Valley Brook production contract."""
+    errors: list[str] = []
+    if manifest.get("quality_floor") != QUALITY_FLOOR:
+        errors.append(f"quality floor must be {QUALITY_FLOOR}")
+    output_format = manifest.get("output_format")
+    expected_canvas = NATIVE_CANVASES.get(output_format) if isinstance(output_format, str) else None
+    if expected_canvas is None:
+        errors.append("output format must be exactly 9:16 or 16:9")
+    if manifest.get("requires_spatial_parallax") is not True:
+        errors.append("spatial parallax must be required")
+    shots = manifest.get("shots")
+    if not isinstance(shots, list) or not shots:
+        errors.append("quality contract requires shots")
+        return errors
+    for index, row in enumerate(shots, 1):
+        request = row.get("animation_request") if isinstance(row, dict) else None
+        if not isinstance(request, dict):
+            errors.append(f"shot {index} lacks animation request")
+            continue
+        if expected_canvas is not None and request.get("output") != expected_canvas:
+            errors.append(f"shot {index} native canvas must be {expected_canvas}")
+        sources = request.get("source_stills")
+        if not isinstance(sources, list) or len(sources) != 1:
+            errors.append(f"shot {index} must animate exactly one approved wide anchor")
+        source_hash = request.get("source_delivery_sha256")
+        if not isinstance(source_hash, str) or len(source_hash) != 64:
+            errors.append(f"shot {index} lacks source-bound anchor hash")
+    return errors
+
+
+def measure_anchor_start_fidelity(anchor_bgr: np.ndarray, first_frame_bgr: np.ndarray) -> dict:
+    """Detect center crops, wrong starts, and aspect conversion at frame zero."""
+    if anchor_bgr.ndim != 3 or first_frame_bgr.ndim != 3:
+        return {"pass": False, "reason": "invalid image arrays"}
+    ah, aw = anchor_bgr.shape[:2]
+    fh, fw = first_frame_bgr.shape[:2]
+    if aw <= 0 or ah <= 0 or fw <= 0 or fh <= 0 or aw * fh != fw * ah:
+        return {"pass": False, "reason": "anchor and frame-zero aspect ratios differ"}
+    size = (320, 180) if aw > ah else (180, 320)
+    anchor = cv2.resize(cv2.cvtColor(anchor_bgr, cv2.COLOR_BGR2GRAY), size).astype(np.float32)
+    frame = cv2.resize(cv2.cvtColor(first_frame_bgr, cv2.COLOR_BGR2GRAY), size).astype(np.float32)
+    anchor_norm = (anchor - anchor.mean()) / max(float(anchor.std()), 1.0)
+    frame_norm = (frame - frame.mean()) / max(float(frame.std()), 1.0)
+    luminance_correlation = float(np.mean(anchor_norm * frame_norm))
+    anchor_edges = cv2.Canny(anchor.astype(np.uint8), 60, 160).astype(np.float32)
+    frame_edges = cv2.Canny(frame.astype(np.uint8), 60, 160).astype(np.float32)
+    edge_union = float(np.count_nonzero((anchor_edges > 0) | (frame_edges > 0)))
+    edge_overlap = float(np.count_nonzero((anchor_edges > 0) & (frame_edges > 0)))
+    edge_iou = edge_overlap / edge_union if edge_union else 0.0
+    passed = luminance_correlation >= 0.82 and edge_iou >= 0.35
+    return {
+        "pass": bool(passed),
+        "luminance_correlation": luminance_correlation,
+        "edge_iou": edge_iou,
+        "thresholds": {"luminance_correlation_min": 0.82, "edge_iou_min": 0.35},
+    }
+
+
+def framing_verdict_errors(
+    payload: dict,
+    *,
+    shot_id: str,
+    output_format: str,
+    anchor_sha256: str,
+    clip_sha256: str,
+) -> list[str]:
+    """Require a vision-reviewed verdict bound to the exact anchor and clip bytes."""
+    errors: list[str] = []
+    expected = {
+        "schema": "recorrido-wide-framing-verdict-1",
+        "status": "pass",
+        "shot_id": shot_id,
+        "output_format": output_format,
+        "anchor_sha256": anchor_sha256,
+        "clip_sha256": clip_sha256,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            errors.append(f"framing verdict {key} mismatch")
+    if payload.get("reviewer") not in {"vision", "human"}:
+        errors.append("framing verdict requires vision or human reviewer")
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        return errors + ["framing verdict checks missing"]
+    for name in REQUIRED_FRAMING_CHECKS:
+        if checks.get(name) is not True:
+            errors.append(f"framing verdict failed: {name}")
+    return errors
+
+
 def analyze_clip(path: Path, *, require_spatial_parallax: bool = True) -> tuple[dict, list[Image.Image]]:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -150,6 +253,12 @@ def requests_by_shot(manifest: dict) -> dict[str, dict]:
 def build_job(job: Path) -> dict:
     results = json.loads((job / "v16/generation_results.json").read_text())
     manifest = json.loads((job / "v16/generation_manifest.json").read_text())
+    contract_errors = quality_contract_errors(manifest)
+    if contract_errors:
+        raise RuntimeError("release quality contract failed: " + "; ".join(contract_errors))
+    output_format = str(manifest["output_format"])
+    expected_canvas = NATIVE_CANVASES[output_format]
+    expected_width, expected_height = (int(value) for value in expected_canvas.split("x"))
     requests = requests_by_shot(manifest)
     require_spatial_parallax = manifest.get("requires_spatial_parallax", True) is not False
     rows = results["shots"]
@@ -169,6 +278,42 @@ def build_job(job: Path) -> dict:
         if sha256(clip) != row["sha256"]:
             raise RuntimeError(f"clip hash mismatch: {job.name}/{shot_id}")
         clip_qa, samples = analyze_clip(clip, require_spatial_parallax=require_spatial_parallax)
+        anchor_image = cv2.imread(str(anchor), cv2.IMREAD_COLOR)
+        capture = cv2.VideoCapture(str(clip))
+        first_ok, first_frame = capture.read()
+        capture.release()
+        if anchor_image is None or not first_ok or first_frame is None:
+            raise RuntimeError(f"frame-zero extraction failed: {job.name}/{shot_id}")
+        anchor_start = measure_anchor_start_fidelity(anchor_image, first_frame)
+
+        verdict_relative = row.get("framing_qa_path")
+        if not isinstance(verdict_relative, str) or not verdict_relative:
+            raise RuntimeError(f"missing framing QA verdict: {job.name}/{shot_id}")
+        v16_root = (job / "v16").resolve()
+        verdict_path = (v16_root / verdict_relative).resolve()
+        if v16_root not in verdict_path.parents or not verdict_path.is_file():
+            raise RuntimeError(f"invalid framing QA verdict path: {job.name}/{shot_id}")
+        verdict = json.loads(verdict_path.read_text())
+        verdict_errors = framing_verdict_errors(
+            verdict,
+            shot_id=shot_id,
+            output_format=output_format,
+            anchor_sha256=sha256(anchor),
+            clip_sha256=sha256(clip),
+        )
+        native_canvas_pass = (
+            clip_qa["width"] == expected_width and clip_qa["height"] == expected_height
+        )
+        clip_qa["anchor_start_fidelity"] = anchor_start
+        clip_qa["native_canvas_pass"] = native_canvas_pass
+        clip_qa["framing_verdict_path"] = str(verdict_path)
+        clip_qa["framing_verdict_errors"] = verdict_errors
+        clip_qa["technical_pass"] = bool(
+            clip_qa["technical_pass"]
+            and anchor_start.get("pass") is True
+            and native_canvas_pass
+            and not verdict_errors
+        )
         clip_qa.update({"shot_id": shot_id, "anchor_path": str(anchor), "anchor_sha256": sha256(anchor)})
         technical.append(clip_qa)
         y = 62 + index * 330
