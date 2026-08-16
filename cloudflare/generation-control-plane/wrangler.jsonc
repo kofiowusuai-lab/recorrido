@@ -6,7 +6,7 @@
   "workers_dev": true,
   "vars": {
     "ENVIRONMENT": "production",
-    "RELEASE": "2026-08-15.1"
+    "RELEASE": "2026-08-16.1"
   },
   "r2_buckets": [
     { "binding": "INPUTS", "bucket_name": "recorrido-generation-inputs" },
@@ -44,7 +44,7 @@
       "name": "recorrido-generation-control-plane-staging",
       "vars": {
         "ENVIRONMENT": "staging",
-        "RELEASE": "2026-08-15.1-staging"
+        "RELEASE": "2026-08-16.1-staging"
       },
       "r2_buckets": [
         { "binding": "INPUTS", "bucket_name": "recorrido-generation-inputs-staging" },

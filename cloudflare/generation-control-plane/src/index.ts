@@ -23,6 +23,8 @@ interface GenerationMessage {
   idempotency_key: string;
   input_manifest_key: string;
   manifest_sha256: string;
+  output_format: "9:16" | "16:9";
+  source_listing_id: string;
 }
 
 interface IngressBody {
@@ -34,12 +36,15 @@ interface IngressBody {
 
 type DispatchStatus = "pending" | "dispatching" | "enqueued" | "delivered" | "dead";
 type LeaseFence = { environment: EnvironmentName; workerId: string; leaseToken: string; leaseVersion: number };
+type DeliveryFence = { environment: EnvironmentName; workerId: string; claimToken: string; attempt: number };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const WORKER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const SOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PROVIDER_ID = /^[A-Za-z0-9._:@/-]{1,255}$/;
 const MAX_INPUT_OBJECT_BYTES = 25_000_000;
 const MAX_MANIFEST_BYTES = 1_000_000;
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -168,10 +173,25 @@ async function createJob(request: Request, env: Env): Promise<Response> {
   if (!environment || !authorityReady(env)) return json({ error: "authority_unavailable" }, 503);
   const body = ingressBody(await parseObject(request));
   if (!body) return json({ error: "invalid_request" }, 422);
-  const manifest = await env.INPUTS.head(body.input_manifest_key);
+  const manifest = await env.INPUTS.get(body.input_manifest_key);
   if (!manifest) return json({ error: "input_manifest_missing" }, 422);
+  if (manifest.size > MAX_MANIFEST_BYTES) return json({ error: "invalid_manifest" }, 422);
+  const manifestBytes = await manifest.arrayBuffer();
+  const computedManifestSha256 = hex(await crypto.subtle.digest("SHA-256", manifestBytes));
   const manifestSha256 = manifest.customMetadata?.sha256;
   if (!manifestSha256 || !SHA256.test(manifestSha256)) return json({ error: "manifest_digest_missing" }, 422);
+  if (computedManifestSha256 !== manifestSha256) return json({ error: "manifest_digest_mismatch" }, 422);
+  let manifestDocument: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(manifestBytes));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
+    manifestDocument = parsed as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_manifest" }, 422);
+  }
+  const outputFormat = manifestDocument.output_format;
+  const sourceListingId = manifestDocument.source_listing_id;
+  if ((outputFormat !== "9:16" && outputFormat !== "16:9") || typeof sourceListingId !== "string" || !SOURCE_ID.test(sourceListingId)) return json({ error: "delivery_binding_missing" }, 422);
 
   type Prepared = { allowed: boolean; job_id: string; reservation_id?: string | null; status: string; dispatch_status?: string; reason?: string };
   let prepared: Prepared;
@@ -183,6 +203,8 @@ async function createJob(request: Request, env: Env): Promise<Response> {
       p_input_manifest_key: body.input_manifest_key,
       p_manifest_sha256: manifestSha256,
       p_environment: environment,
+      p_output_format: outputFormat,
+      p_source_listing_id: sourceListingId,
     });
   } catch (error) {
     log("generation_prepare_failed", { account_id: body.account_id, environment, error_code: error instanceof Error ? error.message : "authority_error" });
@@ -237,6 +259,94 @@ async function heartbeatJob(request: Request, env: Env, jobId: string): Promise<
     log("generation_heartbeat_failed", { job_id: jobId, environment, error_code: error instanceof Error ? error.message : "authority_error" });
     return leaseError(error);
   }
+}
+
+function deliveryFence(value: Record<string, unknown> | null, environment: EnvironmentName): DeliveryFence | null {
+  if (!value) return null;
+  const workerId = value.worker_id;
+  const claimToken = value.claim_token;
+  const attempt = value.attempt;
+  if (value.environment !== environment || typeof workerId !== "string" || !WORKER_ID.test(workerId)
+      || typeof claimToken !== "string" || !UUID.test(claimToken)
+      || typeof attempt !== "number" || !Number.isSafeInteger(attempt) || attempt < 1) return null;
+  return { environment, workerId, claimToken, attempt };
+}
+
+function deliveryRpcBody(deliveryId: string, fence: DeliveryFence): Record<string, unknown> {
+  return { p_delivery_id: deliveryId, p_environment: fence.environment, p_worker_id: fence.workerId,
+    p_claim_token: fence.claimToken, p_attempt: fence.attempt };
+}
+
+async function claimDelivery(request: Request, env: Env): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env)) return json({ error: "authority_unavailable" }, 503);
+  const body = await parseObject(request);
+  if (!body || Object.keys(body).length !== 1 || typeof body.worker_id !== "string" || !WORKER_ID.test(body.worker_id)) return json({ error: "invalid_request" }, 422);
+  try { return json(await rpc(env, "recorrido_claim_customer_delivery", { p_environment: environment, p_worker_id: body.worker_id })); }
+  catch (error) {
+    log("customer_delivery_claim_failed", { environment, error_code: error instanceof Error ? error.message : "authority_error" });
+    return json({ error: "authority_unavailable" }, 503);
+  }
+}
+
+async function heartbeatDelivery(request: Request, env: Env, deliveryId: string): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env) || !UUID.test(deliveryId)) return json({ error: "invalid_request" }, 422);
+  const fence = deliveryFence(await parseObject(request), environment);
+  if (!fence) return json({ error: "invalid_request" }, 422);
+  try { return json(await rpc(env, "recorrido_heartbeat_customer_delivery", deliveryRpcBody(deliveryId, fence))); }
+  catch (error) { return leaseError(error); }
+}
+
+async function getDeliveryMedia(request: Request, env: Env, deliveryId: string, url: URL): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env) || !UUID.test(deliveryId)) return json({ error: "invalid_request" }, 422);
+  const fence = deliveryFence({ environment: url.searchParams.get("environment"), worker_id: url.searchParams.get("worker_id"),
+    claim_token: url.searchParams.get("claim_token"), attempt: Number(url.searchParams.get("attempt")) }, environment);
+  if (!fence) return json({ error: "invalid_request" }, 422);
+  try {
+    const binding = await rpc<{ authorized?: boolean; output_object_key?: string; output_sha256?: string }>(env, "recorrido_assert_customer_delivery_media", deliveryRpcBody(deliveryId, fence));
+    if (!binding.authorized || typeof binding.output_object_key !== "string" || typeof binding.output_sha256 !== "string" || !SHA256.test(binding.output_sha256)) return json({ error: "invalid_delivery_binding" }, 503);
+    const object = await env.OUTPUTS.get(binding.output_object_key);
+    if (!object || object.customMetadata?.sha256 !== binding.output_sha256 || object.size <= 0 || object.size > MAX_OUTPUT_BYTES) return json({ error: "delivery_media_unavailable" }, 503);
+    return new Response(object.body, { status: 200, headers: { "content-type": "video/mp4", "content-length": String(object.size),
+      "x-content-sha256": binding.output_sha256, "cache-control": "no-store", "content-disposition": "attachment; filename=recorrido.mp4" } });
+  } catch (error) { return leaseError(error); }
+}
+
+async function checkpointDelivery(request: Request, env: Env, deliveryId: string): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env) || !UUID.test(deliveryId)) return json({ error: "invalid_request" }, 422);
+  const body = await parseObject(request); const fence = deliveryFence(body, environment); const phase = body?.phase;
+  if (!fence || (phase !== "media" && phase !== "notice")) return json({ error: "invalid_request" }, 422);
+  try { return json(await rpc(env, "recorrido_checkpoint_customer_delivery", { ...deliveryRpcBody(deliveryId, fence), p_phase: phase })); }
+  catch (error) { return leaseError(error); }
+}
+
+async function acceptDelivery(request: Request, env: Env, deliveryId: string, phase: "media" | "notice"): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env) || !UUID.test(deliveryId)) return json({ error: "invalid_request" }, 422);
+  const body = await parseObject(request); const fence = deliveryFence(body, environment); const providerId = body?.provider_message_id;
+  if (!fence || typeof providerId !== "string" || !PROVIDER_ID.test(providerId)) return json({ error: "invalid_request" }, 422);
+  try {
+    const name = phase === "media" ? "recorrido_accept_customer_delivery_media" : "recorrido_accept_customer_delivery_notice";
+    return json(await rpc(env, name, { ...deliveryRpcBody(deliveryId, fence), p_provider_message_id: providerId }));
+  } catch (error) { return leaseError(error); }
+}
+
+async function abandonDelivery(request: Request, env: Env, deliveryId: string): Promise<Response> {
+  if (!authorized(request, env.LOCAL_WORKER_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const environment = environmentName(env);
+  if (!environment || !authorityReady(env) || !UUID.test(deliveryId)) return json({ error: "invalid_request" }, 422);
+  const body = await parseObject(request); const fence = deliveryFence(body, environment); const errorCode = body?.error_code;
+  if (!fence || typeof errorCode !== "string" || !/^[A-Za-z0-9_.:-]{1,80}$/.test(errorCode)) return json({ error: "invalid_request" }, 422);
+  try { return json(await rpc(env, "recorrido_abandon_customer_delivery_claim", { ...deliveryRpcBody(deliveryId, fence), p_error_code: errorCode })); }
+  catch (error) { return leaseError(error); }
 }
 
 async function putInput(request: Request, env: Env, url: URL): Promise<Response> {
@@ -453,7 +563,7 @@ async function failJob(request: Request, env: Env, jobId: string): Promise<Respo
 }
 
 function validMessage(body: GenerationMessage | undefined, environment: EnvironmentName): body is GenerationMessage {
-  return Boolean(body && body.version === 1 && body.environment === environment && UUID.test(body.job_id) && UUID.test(body.account_id) && UUID.test(body.reservation_id) && IDEMPOTENCY.test(body.idempotency_key) && SHA256.test(body.manifest_sha256) && body.input_manifest_key === `accounts/${body.account_id}/jobs/${body.idempotency_key}/manifest.json`);
+  return Boolean(body && body.version === 1 && body.environment === environment && UUID.test(body.job_id) && UUID.test(body.account_id) && UUID.test(body.reservation_id) && IDEMPOTENCY.test(body.idempotency_key) && SHA256.test(body.manifest_sha256) && (body.output_format === "9:16" || body.output_format === "16:9") && SOURCE_ID.test(body.source_listing_id) && body.input_manifest_key === `accounts/${body.account_id}/jobs/${body.idempotency_key}/manifest.json`);
 }
 
 function messageBinding(body: GenerationMessage): Record<string, unknown> {
@@ -569,6 +679,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (url.pathname === "/v1/objects/input" && request.method === "GET") return getInput(request, env, url);
   if (request.method === "POST" && url.pathname === "/v1/jobs") return createJob(request, env);
   if (request.method === "POST" && url.pathname === "/v1/leases/next") return claimLease(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/deliveries/next") return claimDelivery(request, env);
+  const deliveryHeartbeat = /^\/v1\/deliveries\/([0-9a-f-]+)\/heartbeat$/i.exec(url.pathname);
+  if (request.method === "POST" && deliveryHeartbeat) return heartbeatDelivery(request, env, deliveryHeartbeat[1]);
+  const deliveryMedia = /^\/v1\/deliveries\/([0-9a-f-]+)\/media$/i.exec(url.pathname);
+  if (request.method === "GET" && deliveryMedia) return getDeliveryMedia(request, env, deliveryMedia[1], url);
+  const deliveryCheckpoint = /^\/v1\/deliveries\/([0-9a-f-]+)\/checkpoint$/i.exec(url.pathname);
+  if (request.method === "POST" && deliveryCheckpoint) return checkpointDelivery(request, env, deliveryCheckpoint[1]);
+  const deliveryMediaAccepted = /^\/v1\/deliveries\/([0-9a-f-]+)\/media-accepted$/i.exec(url.pathname);
+  if (request.method === "POST" && deliveryMediaAccepted) return acceptDelivery(request, env, deliveryMediaAccepted[1], "media");
+  const deliveryNoticeAccepted = /^\/v1\/deliveries\/([0-9a-f-]+)\/notice-accepted$/i.exec(url.pathname);
+  if (request.method === "POST" && deliveryNoticeAccepted) return acceptDelivery(request, env, deliveryNoticeAccepted[1], "notice");
+  const deliveryAbandon = /^\/v1\/deliveries\/([0-9a-f-]+)\/abandon$/i.exec(url.pathname);
+  if (request.method === "POST" && deliveryAbandon) return abandonDelivery(request, env, deliveryAbandon[1]);
   const heartbeat = /^\/v1\/jobs\/([0-9a-f-]+)\/heartbeat$/i.exec(url.pathname);
   if (request.method === "POST" && heartbeat) return heartbeatJob(request, env, heartbeat[1]);
   const outputPart = /^\/v1\/jobs\/([0-9a-f-]+)\/output-parts\/(\d+)$/i.exec(url.pathname);
