@@ -8,7 +8,7 @@ This Worker moves only the previously agreed cloud-suitable control-plane pieces
 - Cron recovery of the Supabase transactional dispatch outbox
 - Privacy-safe structured logs and health checks
 
-Supabase remains the source of truth for billing, reservations, job status, leases, completion, and failure release. Vercel, Stripe, authentication, webhooks, Route 53 DNS, local media generation, local files, Keychain credentials, authenticated desktop profiles, BlueStacks/Baileys, and WhatsApp stay unchanged.
+Supabase remains the source of truth for billing, reservations, job status, generation leases, customer-delivery leases, settlement, and failure release. Vercel, Stripe, authentication, webhooks, Route 53 DNS, local media generation, local files, Keychain credentials, and authenticated desktop profiles stay unchanged. The local Baileys bridge is used only through the account-bound delivery worker.
 
 ## Runtime secrets
 
@@ -51,6 +51,24 @@ Switch runtime environments only through `python3 local/runtime_control.py off|s
 Input objects are create-only. Manifest uploads compute SHA-256 in the Worker, store it as private R2 custom metadata, and pass the digest to the authoritative job-prepare RPC. Replays cannot replace a manifest after its idempotency namespace has been established.
 
 The main Queue consumer marks delivery in Supabase. The separate DLQ consumer terminalizes exhausted dispatches before acknowledging them, and cron recovery terminalizes rows returned in explicit `dead` dispatch state rather than re-enqueueing them.
+
+## Customer delivery transaction
+
+Migration `202608160001_recorrido_customer_delivery.sql` binds `account_id`, `member_id`, reservation, source listing, native output format, recipient E.164, output object/hash, and expected sender identity. The caller never supplies a delivery recipient. Render completion creates one outbox row while the generation reservation remains `reserved`.
+
+`local/delivery_worker.py` claims the server-bound row and verifies the loopback WhatsApp bridge's `accountIdentityHash` before checkpointing. Provider-confirmed media acceptance persists the provider message ID, consumes the reservation once, rereads the committed balance, and stages the Spanish or Portuguese remaining-generation notice. Notice acceptance has a separate lease and provider ID.
+
+Crash behavior fails closed:
+
+- A pre-checkpoint bridge or sender failure abandons the claim for retry without settlement.
+- A crash or timeout after the sending checkpoint without a provider ID stays ambiguous and never auto-resends.
+- A journaled provider ID retries only the Supabase acknowledgement, never the WhatsApp send.
+- Notice failure never resends media or refunds a delivered generation.
+- Expired `media_claimed` and `notice_claimed` leases are reclaimable. `media_sending` and `notice_sending` are not.
+
+Install the LaunchAgent without starting it via `./local/install-delivery.command`. Use `--enable` only after production Worker, Supabase sender hash, and bridge health pass. The protected environment file is `~/.config/recorrido/cloudflare-generation.env`; secrets never appear in process arguments. Runtime delivery remains independently fail-closed in `recorrido_customer_delivery_runtime`.
+
+The real PostgreSQL behavior harness is `tests/run_migration_chain.sh`. It applies the authoritative billing/control-plane predecessor chain to a disposable PostgreSQL 16 cluster, then verifies recipient drift rejection, settlement timing, balance notice content, and idempotent provider acknowledgements.
 
 ## Logging
 

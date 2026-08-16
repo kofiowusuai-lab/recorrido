@@ -14,6 +14,8 @@ class MemoryR2 {
     if (!value) return null;
     const buffer = value.bytes.buffer.slice(value.bytes.byteOffset, value.bytes.byteOffset + value.bytes.byteLength) as ArrayBuffer;
     return {
+      key,
+      size: value.bytes.length,
       body: new Blob([buffer]).stream(),
       arrayBuffer: async () => buffer,
       httpEtag: `\"${key}\"`,
@@ -65,9 +67,12 @@ const uuidM = "22222222-2222-4222-8222-222222222222";
 const uuidJ = "33333333-3333-4333-8333-333333333333";
 const uuidR = "44444444-4444-4444-8444-444444444444";
 const leaseToken = "55555555-5555-4555-8555-555555555555";
+const deliveryId = "66666666-6666-4666-8666-666666666666";
 const leaseVersion = 7;
 const manifestKey = `accounts/${uuidA}/jobs/idempotent-1/manifest.json`;
 const manifestSha256 = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const deliveryManifest = '{"output_format":"9:16","source_listing_id":"listing-001"}';
+const deliveryManifestSha256 = "be6d8c27875aa74e8aff5d43bcc0785e20dbfe20da2e053e826273ee78a2cdef";
 const generationMessage = {
   version: 1 as const,
   environment: "staging" as const,
@@ -77,6 +82,8 @@ const generationMessage = {
   idempotency_key: "idempotent-1",
   input_manifest_key: manifestKey,
   manifest_sha256: manifestSha256,
+  output_format: "9:16" as const,
+  source_listing_id: "listing-001",
 };
 
 function env(overrides: Partial<Env> = {}): Env {
@@ -197,19 +204,19 @@ describe("immutable input and job ingress", () => {
 
   it("prepares the authoritative outbox but never sends directly to Queue", async () => {
     const e = env();
-    await e.INPUTS.put(manifestKey, "{}", { customMetadata: { sha256: manifestSha256 } });
+    await e.INPUTS.put(manifestKey, deliveryManifest, { customMetadata: { sha256: deliveryManifestSha256 } });
     const fetchSpy = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(rpcResult({ allowed: true, job_id: uuidJ, reservation_id: uuidR, status: "queued", dispatch_status: "pending" }));
     const response = await worker.fetch(request("/v1/jobs", auth("ingress-secret", { account_id: uuidA, member_id: uuidM, idempotency_key: "idempotent-1", input_manifest_key: manifestKey })), e);
     expect(response.status).toBe(202);
-    expect(rpcBody(fetchSpy)).toMatchObject({ p_manifest_sha256: manifestSha256, p_environment: "staging" });
+    expect(rpcBody(fetchSpy)).toMatchObject({ p_manifest_sha256: deliveryManifestSha256, p_environment: "staging", p_output_format: "9:16", p_source_listing_id: "listing-001" });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect((e.GENERATION_QUEUE as unknown as MemoryQueue).sent).toEqual([]);
   });
 
   it.each(["dispatching", "enqueued", "delivered"])("does not re-enqueue a live idempotent replay in %s state", async (dispatchStatus) => {
     const e = env();
-    await e.INPUTS.put(manifestKey, "{}", { customMetadata: { sha256: manifestSha256 } });
+    await e.INPUTS.put(manifestKey, deliveryManifest, { customMetadata: { sha256: deliveryManifestSha256 } });
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(rpcResult({ allowed: true, job_id: uuidJ, reservation_id: uuidR, status: "queued", dispatch_status: dispatchStatus }));
     const response = await worker.fetch(request("/v1/jobs", auth("ingress-secret", { account_id: uuidA, member_id: uuidM, idempotency_key: "idempotent-1", input_manifest_key: manifestKey })), e);
     expect(response.status).toBe(200);
@@ -218,7 +225,7 @@ describe("immutable input and job ingress", () => {
 
   it("rejects dead replay instead of claiming it was dispatched", async () => {
     const e = env();
-    await e.INPUTS.put(manifestKey, "{}", { customMetadata: { sha256: manifestSha256 } });
+    await e.INPUTS.put(manifestKey, deliveryManifest, { customMetadata: { sha256: deliveryManifestSha256 } });
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(rpcResult({ allowed: true, job_id: uuidJ, reservation_id: uuidR, status: "failed", dispatch_status: "dead" }));
     const response = await worker.fetch(request("/v1/jobs", auth("ingress-secret", { account_id: uuidA, member_id: uuidM, idempotency_key: "idempotent-1", input_manifest_key: manifestKey })), e);
     expect(response.status).toBe(409);
@@ -386,6 +393,56 @@ describe("lease-fenced local worker boundary", () => {
     expect(await response.json()).toEqual({ error: "output_digest_mismatch" });
     expect(fetchSpy).toHaveBeenCalledOnce();
     expect((e.OUTPUTS as unknown as MemoryR2).objects.size).toBe(0);
+  });
+});
+
+describe("recipient-bound customer delivery API", () => {
+  const fence = { environment: "staging", worker_id: "mac-delivery-01", claim_token: leaseToken, attempt: 1 };
+
+  it("rejects every operator-supplied recipient override before authority access", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const response = await worker.fetch(request("/v1/deliveries/next", auth("worker-secret", { worker_id: "mac-delivery-01", recipient_phone_e164: "+155****9999" })), env());
+    expect(response.status).toBe(422);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("claims only by environment and worker identity", async () => {
+    const claim = { delivery_id: deliveryId, phase: "media", attempt: 1, claim_token: leaseToken,
+      recipient_phone_e164: "+155****1111", expected_sender_identity_hash: "a".repeat(64), output_format: "9:16", source_listing_id: "listing-001" };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(rpcResult(claim));
+    const response = await worker.fetch(request("/v1/deliveries/next", auth("worker-secret", { worker_id: "mac-delivery-01" })), env());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(claim);
+    expect(rpcBody(fetchSpy)).toEqual({ p_environment: "staging", p_worker_id: "mac-delivery-01" });
+  });
+
+  it("streams only the hash-bound R2 output after a full lease assertion", async () => {
+    const e = env(); const bytes = new Uint8Array([1, 2, 3]);
+    const digest = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
+    const key = `accounts/${uuidA}/jobs/${uuidJ}/leases/${leaseToken}/output.mp4`;
+    await e.OUTPUTS.put(key, bytes, { customMetadata: { sha256: digest }, httpMetadata: { contentType: "video/mp4" } });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(rpcResult({ authorized: true, output_object_key: key, output_sha256: digest }));
+    const query = new URLSearchParams({ environment: "staging", worker_id: "mac-delivery-01", claim_token: leaseToken, attempt: "1" });
+    const response = await worker.fetch(request(`/v1/deliveries/${deliveryId}/media?${query}` , { headers: { authorization: "Bearer worker-secret" } }), e);
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    expect(response.headers.get("x-content-sha256")).toBe(digest);
+    expect(rpcBody(fetchSpy)).toEqual({ p_delivery_id: deliveryId, p_environment: "staging", p_worker_id: "mac-delivery-01", p_claim_token: leaseToken, p_attempt: 1 });
+  });
+
+  it("checkpoints before sends and persists provider ids through phase-specific acceptance", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(rpcResult({ status: "media_sending" }))
+      .mockResolvedValueOnce(rpcResult({ status: "notice_pending", remaining_generations: 3 }))
+      .mockResolvedValueOnce(rpcResult({ status: "delivered", remaining_generations: 3 }));
+    const checkpoint = await worker.fetch(request(`/v1/deliveries/${deliveryId}/checkpoint`, auth("worker-secret", { ...fence, phase: "media" })), env());
+    const media = await worker.fetch(request(`/v1/deliveries/${deliveryId}/media-accepted`, auth("worker-secret", { ...fence, provider_message_id: "media.123" })), env());
+    const notice = await worker.fetch(request(`/v1/deliveries/${deliveryId}/notice-accepted`, auth("worker-secret", { ...fence, provider_message_id: "notice.123" })), env());
+    expect([checkpoint.status, media.status, notice.status]).toEqual([200, 200, 200]);
+    expect(String(fetchSpy.mock.calls[0][0])).toContain("recorrido_checkpoint_customer_delivery");
+    expect(String(fetchSpy.mock.calls[1][0])).toContain("recorrido_accept_customer_delivery_media");
+    expect(String(fetchSpy.mock.calls[2][0])).toContain("recorrido_accept_customer_delivery_notice");
+    expect(rpcBody(fetchSpy, 1)).toMatchObject({ p_provider_message_id: "media.123", p_claim_token: leaseToken, p_attempt: 1 });
   });
 });
 

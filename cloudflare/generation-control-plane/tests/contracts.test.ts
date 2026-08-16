@@ -187,3 +187,87 @@ describe("Supabase authority contract", () => {
     expect(installer).toContain("install -m 600");
   });
 });
+
+describe("recipient-bound customer delivery authority", () => {
+  const deliveryMigration = "../../supabase/migrations/202608160001_recorrido_customer_delivery.sql";
+
+  it("keeps format, source, recipient, output, and sender identity immutable", () => {
+    const sql = read(deliveryMigration).toLowerCase();
+    for (const field of [
+      "output_format", "source_listing_id", "recipient_phone_e164", "output_object_key",
+      "output_sha256", "expected_sender_identity_hash", "media_provider_message_id",
+      "notice_provider_message_id", "remaining_generations",
+    ]) expect(sql).toContain(field);
+    expect(sql).toContain("create table public.recorrido_customer_delivery_outbox");
+    expect(sql).toContain("create table public.recorrido_customer_delivery_attempts");
+    expect(sql).toContain("unique (reservation_id)");
+    expect(sql).toContain("unique (job_id)");
+    expect(sql).toMatch(/output_format[\s\S]*check \(output_format in \('9:16','16:9'\)\)/);
+  });
+
+  it("stages delivery at render completion and consumes only on provider media acceptance", () => {
+    const sql = read(deliveryMigration).toLowerCase();
+    const body = (name: string) => sql.split(`function public.${name}`)[1]?.split("$$;")[0] ?? "";
+    const render = body("recorrido_complete_generation_dispatch");
+    expect(render).toContain("recorrido_customer_delivery_outbox");
+    expect(render).not.toContain("recorrido_complete_generation(");
+    expect(render).toMatch(/status\s*<>\s*'reserved'/);
+
+    const accepted = body("recorrido_accept_customer_delivery_media");
+    expect(accepted).toContain("recorrido_complete_generation(");
+    expect(accepted).toMatch(/media_provider_message_id[\s\S]*remaining_generations/);
+    expect(accepted).toMatch(/recorrido_available_credits/);
+  });
+
+  it("uses fenced two-phase media and notice leases and never auto-reclaims sending states", () => {
+    const sql = read(deliveryMigration).toLowerCase();
+    const body = (name: string) => sql.split(`function public.${name}`)[1]?.split("$$;")[0] ?? "";
+    for (const fn of [
+      "recorrido_claim_customer_delivery", "recorrido_heartbeat_customer_delivery",
+      "recorrido_checkpoint_customer_delivery", "recorrido_assert_customer_delivery_media",
+      "recorrido_accept_customer_delivery_media", "recorrido_accept_customer_delivery_notice",
+      "recorrido_abandon_customer_delivery_claim",
+    ]) expect(sql).toContain(`function public.${fn}`);
+    for (const fn of [
+      "recorrido_heartbeat_customer_delivery", "recorrido_checkpoint_customer_delivery",
+      "recorrido_assert_customer_delivery_media", "recorrido_accept_customer_delivery_media",
+      "recorrido_accept_customer_delivery_notice", "recorrido_abandon_customer_delivery_claim",
+    ]) expect(body(fn)).toMatch(/p_claim_token uuid[\s\S]*p_attempt integer/);
+    expect(body("recorrido_claim_customer_delivery")).toMatch(/status in \('pending','notice_pending'\)/);
+    expect(body("recorrido_claim_customer_delivery")).toMatch(/status in \('media_claimed','notice_claimed'\)[\s\S]*lease_expires_at<now\(\)/);
+    expect(body("recorrido_claim_customer_delivery")).not.toMatch(/media_sending[\s\S]*(pending|media_claimed)/);
+    expect(body("recorrido_claim_customer_delivery")).not.toMatch(/notice_sending[\s\S]*(notice_pending|notice_claimed)/);
+  });
+
+  it("re-resolves the active account member identity before claims and binds same-recipient notices", () => {
+    const sql = read(deliveryMigration).toLowerCase();
+    const body = (name: string) => sql.split(`function public.${name}`)[1]?.split("$$;")[0] ?? "";
+    const claim = body("recorrido_claim_customer_delivery");
+    expect(claim).toMatch(/recorrido_account_members[\s\S]*status\s*=\s*'active'/);
+    expect(claim).toMatch(/recorrido_whatsapp_identities[\s\S]*recipient_phone_e164/);
+    expect(body("recorrido_accept_customer_delivery_media")).toMatch(/notice_text[\s\S]*(generaciones|gerações)/);
+  });
+
+  it("keeps every delivery table private and grants only narrow RPC execution", () => {
+    const sql = read(deliveryMigration).toLowerCase();
+    for (const table of ["recorrido_customer_delivery_runtime", "recorrido_customer_delivery_outbox", "recorrido_customer_delivery_attempts"]) {
+      expect(sql).toContain(`alter table public.${table} enable row level security`);
+      expect(sql).toContain(`revoke all on table public.${table} from public, anon, authenticated`);
+    }
+    expect(sql).toMatch(/revoke all on function public\.recorrido_claim_customer_delivery[\s\S]*from public\s*,\s*anon\s*,\s*authenticated/);
+  });
+
+  it("packages the delivery worker without secrets in process arguments and installs disabled", () => {
+    const worker = read("local/delivery_worker.py");
+    const plist = read("local/com.recorrido.customer-delivery-worker.plist");
+    const installer = read("local/install-delivery.command");
+    expect(worker).toContain("accountIdentityHash");
+    expect(worker).toContain("provider_accepted");
+    expect(plist).toContain("recorrido_customer_delivery_worker.py");
+    expect(plist).toContain("cloudflare-generation.env");
+    expect(plist).not.toContain("LOCAL_WORKER_TOKEN=");
+    expect(installer).toContain("installed but disabled");
+    expect(installer).toContain("install -m 700");
+    expect(installer).toContain("install -m 600");
+  });
+});
